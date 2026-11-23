@@ -64,7 +64,7 @@ export class MarkdownReader implements Component {
 	}
 
 	private rows(): number {
-		return Math.max(6, (this.tui.terminal.rows ?? 24) - 2);
+		return Math.max(6, this.tui.terminal.rows ?? 24);
 	}
 
 	private page(): number {

@@ -6,8 +6,8 @@
 // Installed by the pi-md-viewer extension; edits here are overwritten.
 
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, TextView } from "gpui-base";
-import { appHome, checking, exec, props, readTextFile, theme, writeTextFile } from "herdr";
+import { v_flex, h_flex, ScrollHandle, TextView } from "gpui-base";
+import { appHome, checking, exec, nextCommand, props, readTextFile, theme, writeTextFile } from "herdr";
 
 const READ_MS = 700;
 const BEAT_MS = 5000;
@@ -40,17 +40,23 @@ function stats(text) {
   return `${words.toLocaleString("en-US")} words · ${mins} min read`;
 }
 
-/** Headings outside code fences, for the outline. */
-function outline(text) {
-  const out = [];
+/**
+ * Split the document at its headings (h1-h3, outside code fences): one section per
+ * heading, plus any text before the first. Each section is drawn on its own so the
+ * outline can scroll to it.
+ */
+function sections(text) {
+  const out = [{ heading: null, lines: [] }];
   let fence = false;
   for (const line of text.split("\n")) {
     if (/^\s*(```|~~~)/.test(line)) fence = !fence;
-    if (fence) continue;
-    const m = /^(#{1,3})\s+(.+?)\s*#*\s*$/.exec(line);
-    if (m) out.push({ level: m[1].length, title: m[2].replace(/[`*_]/g, "") });
+    const m = !fence && /^(#{1,3})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (m) out.push({ heading: { level: m[1].length, title: m[2].replace(/[`*_]/g, "") }, lines: [line] });
+    else out[out.length - 1].lines.push(line);
   }
-  return out;
+  return out
+    .map((s) => ({ heading: s.heading, text: s.lines.join("\n").trim() }))
+    .filter((s) => s.heading || s.text);
 }
 
 /** Drop YAML front matter: show it as a small table-ish block instead of raw dashes. */
@@ -79,9 +85,23 @@ export default class MdViewer extends View {
     this.showOutline = localStorage.getItem("outline") !== "off";
     this.width = 900;
     this.nonce = 0;
+    this.doc = null;
+    this.scroll = ScrollHandle.new();
     if (checking()) return;
     this.tick(cx);
     this.beat();
+    this.section = 0;
+    // Key commands (keys.json "mod:md-viewer" or "md-viewer.next"): next / prev section, top.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand();
+        const n = this.doc?.secs.length ?? 0;
+        if (!n) continue;
+        if (c === "next") this.jump(Math.min(n - 1, this.section + 1), cx);
+        else if (c === "prev") this.jump(Math.max(0, this.section - 1), cx);
+        else if (c === "top") this.jump(0, cx);
+      }
+    });
     cx.timer.every(READ_MS, (cx) => this.tick(cx));
     cx.timer.every(BEAT_MS, (cx) => {
       this.beat();
@@ -99,11 +119,7 @@ export default class MdViewer extends View {
           this.control = raw;
           try {
             const c = JSON.parse(raw);
-            if (c.file && c.file !== this.file) {
-              this.file = c.file;
-              this.text = null;
-              this.nonce++;
-            }
+            if (c.file && c.file !== this.file) this.switchTo(c.file);
             this.follow = !!c.follow;
             this.recent = Array.isArray(c.recent) ? c.recent : [];
             changed = true;
@@ -123,6 +139,8 @@ export default class MdViewer extends View {
         } else if (text !== undefined && text !== this.text) {
           if (this.text !== null) this.changedAt = Date.now();
           this.text = text;
+          const fm = frontMatter(text);
+          this.doc = { ...fm, secs: sections(fm.body) };
           this.problem = "";
           changed = true;
         }
@@ -141,11 +159,20 @@ export default class MdViewer extends View {
     })().catch(() => {});
   }
 
-  open(file, cx) {
-    if (file === this.file) return;
+  switchTo(file) {
     this.file = file;
     this.text = null;
+    this.doc = null;
+    this.changedAt = 0;
+    this.seenAt = Date.now();
     this.nonce++;
+    this.section = 0;
+    this.scroll.scroll_to_item(0);
+  }
+
+  open(file, cx) {
+    if (file === this.file) return;
+    this.switchTo(file);
     this.tick(cx);
   }
 
@@ -260,6 +287,9 @@ export default class MdViewer extends View {
                 .when(h.level === 1, (x) => x.font_semibold())
                 .text_color(h.level === 1 ? t.foreground : t.muted)
                 .truncate()
+                .cursor_pointer()
+                .hover((x) => x.bg(t.hover).text_color(t.foreground))
+                .on_click((_e, cx) => this.jump(h.index, cx))
                 .child(h.title),
             ),
           ),
@@ -300,62 +330,74 @@ export default class MdViewer extends View {
     if (!this.file) return this.empty(t, "No file yet", "Run /md in Pi, or let the agent write a .md file.");
     if (this.problem === "missing") return this.empty(t, "File not found", shortDir(this.file) + "/" + base(this.file));
     if (this.problem) return this.empty(t, "Can't show this file", this.problem);
-    if (this.text === null) return this.empty(t, "Loading…", "");
-    const { meta, body } = frontMatter(this.text);
+    if (this.text === null || !this.doc) return this.empty(t, "Loading…", "");
+    const { meta, body, secs } = this.doc;
     const pad = this.width < 640 ? 20 : 44;
-    return div()
+    const column = () => v_flex().w_full().max_w(760).px(pad);
+    return v_flex()
       .id(`scroll-${this.nonce}`)
       .flex_1()
       .h_full()
       .overflow_y_scrollbar()
+      .track_scroll(this.scroll)
+      .items_center()
+      .child(column().pt(28).pb(10).child(div().text_size(11).text_color(t.dim).child(`${stats(body)} · ${this.changedAt ? "updated " + ago(Date.now() - this.changedAt) : "shown " + ago(Date.now() - this.seenAt)}`)))
       .child(
-        v_flex()
-          .w_full()
-          .items_center()
-          .child(
+        column().when(meta.length > 0, (s) =>
+          s.pb(6).child(
             v_flex()
-              .w_full()
-              .max_w(760)
-              .px(pad)
-              .pt(28)
-              .pb(80)
-              .gap(14)
-              .child(div().text_size(11).text_color(t.dim).child(`${stats(body)} · ${this.changedAt ? "updated " + ago(Date.now() - this.changedAt) : "opened " + ago(Date.now() - this.seenAt)}`))
-              .when(meta.length > 0, (s) =>
-                s.child(
-                  v_flex()
-                    .gap(3)
-                    .p(10)
-                    .rounded(6)
-                    .bg(t.surface)
-                    .border(1)
-                    .border_color(t.border)
-                    .children(
-                      meta.map(([k, v], i) =>
-                        h_flex()
-                          .id(`m-${i}`)
-                          .gap(10)
-                          .text_size(12)
-                          .child(div().w(90).flex_none().text_color(t.dim).child(k))
-                          .child(div().flex_1().text_color(t.muted).child(v)),
-                      ),
-                    ),
+              .gap(3)
+              .p(10)
+              .rounded(6)
+              .bg(t.surface)
+              .border(1)
+              .border_color(t.border)
+              .children(
+                meta.map(([k, v], i) =>
+                  h_flex()
+                    .id(`m-${i}`)
+                    .gap(10)
+                    .text_size(12)
+                    .child(div().w(90).flex_none().text_color(t.dim).child(k))
+                    .child(div().flex_1().text_color(t.muted).child(v)),
                 ),
-              )
-              .child(
-                div()
-                  .text_size(this.size)
-                  .line_height(1.6)
-                  .text_color(t.foreground)
-                  .child(TextView.markdown(`md-${this.nonce}`, body).selectable(true)),
               ),
           ),
-      );
+        ),
+      )
+      .children(
+        secs.map((sec, i) =>
+          column()
+            .pt(i === 0 ? 0 : 14)
+            .child(
+              div()
+                .w_full()
+                .text_size(this.size)
+                .line_height(1.6)
+                .text_color(t.foreground)
+                .child(TextView.markdown(`md-${this.nonce}-${i}`, sec.text).selectable(true)),
+            ),
+        ),
+      )
+      .child(column().h(120));
+  }
+
+  /** Scroll so section i starts at the top: jump past it to the end, then back up to it. */
+  jump(i, cx) {
+    this.section = i;
+    const first = 2; // the stats line and the front-matter slot come before the sections
+    const last = first + this.doc.secs.length; // the bottom spacer
+    this.scroll.scroll_to_item(last);
+    cx.notify();
+    cx.timer.after(40, (cx) => {
+      this.scroll.scroll_to_item(first + i);
+      cx.notify();
+    });
   }
 
   render() {
     const t = theme();
-    const heads = this.text ? outline(frontMatter(this.text).body) : [];
+    const heads = this.doc ? this.doc.secs.map((s, i) => (s.heading ? { ...s.heading, index: i } : null)).filter(Boolean) : [];
     const side = this.showOutline && this.width >= 760 && (heads.length > 1 || this.recent.length > 1);
     return v_flex()
       .id("root")
