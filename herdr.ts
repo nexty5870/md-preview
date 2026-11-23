@@ -19,7 +19,10 @@ export const appHome = () => process.env.HERDR_APP_HOME || path.join(os.homedir(
 const appBin = () => process.env.HERDR_APP_BIN || "herdr-app";
 const modDir = () => path.join(appHome(), "mods", MOD_NAME);
 
-export type Control = { file: string; follow: boolean; recent: string[] };
+/** What the pane shows. `mermaid`: how the pane renders diagrams (node + render-mermaid.ts). */
+export type Control = { file: string; follow: boolean; recent: string[]; mermaid?: { node: string; script: string } };
+
+export const mermaidRenderer = () => ({ node: /^node(\.exe)?$/.test(path.basename(process.execPath)) ? process.execPath : "node", script: path.join(path.dirname(fileURLToPath(import.meta.url)), "render-mermaid.ts") });
 
 async function appDo<T>(pi: ExtensionAPI, command: string, args: Record<string, unknown>): Promise<T> {
 	const res = await pi.exec(appBin(), ["do", command, JSON.stringify(args)], { timeout: 10_000 });
@@ -52,6 +55,7 @@ export function installMod(): void {
 	}
 	fs.mkdirSync(path.join(dest, ".alive"), { recursive: true });
 	fs.mkdirSync(path.join(dest, ".state"), { recursive: true });
+	fs.mkdirSync(path.join(dest, ".cache"), { recursive: true });
 	const marker = path.join(dest, MARKER);
 	if (!fs.existsSync(marker)) fs.writeFileSync(marker, "Installed by the pi-md-viewer Pi extension. Safe to delete with this folder.\n");
 	for (const f of fs.readdirSync(MOD_SOURCE)) {
@@ -74,6 +78,7 @@ export function viewerOpen(id: string): boolean {
 }
 
 export function writeControl(id: string, c: Control): void {
+	c = { mermaid: mermaidRenderer(), ...c };
 	const file = controlFile(id);
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(`${file}.tmp`, JSON.stringify(c, null, 2));
@@ -81,18 +86,20 @@ export function writeControl(id: string, c: Control): void {
 }
 
 /** Show `c.file` in the viewer pane for `id`: reuse an open one, else split one to the right of this Pi. */
-export async function showInApp(pi: ExtensionAPI, id: string, c: Control, below = false): Promise<"reused" | "opened"> {
+export async function showInApp(pi: ExtensionAPI, id: string, c: Control, opts: { keepFocus?: boolean } = {}): Promise<"reused" | "opened"> {
 	installMod();
-	writeControl(id, c);
+	writeControl(id, { ...c, mermaid: mermaidRenderer() });
 	if (viewerOpen(id)) return "reused";
 	const pane = await myPane(pi);
 	// A just-copied mod may not be loaded yet (the app hot-reloads mods/): retry briefly.
 	const until = Date.now() + 8_000;
 	for (;;) {
 		try {
-			await appDo(pi, "pane.split", { direction: below ? "down" : "right", pane, mod: MOD_NAME, props: { control: controlFile(id), id } });
+			await appDo(pi, "pane.split", { direction: "right", pane, mod: MOD_NAME, props: { control: controlFile(id), id } });
 			// Count it as open right away, so a second /md before its first beat doesn't split again.
 			fs.writeFileSync(beatFile(id), String(Date.now()));
+			// Opened on its own (the agent wrote a file): give the keyboard back to Pi.
+			if (opts.keepFocus) await appDo(pi, "pane.focus", { pane }).catch(() => undefined);
 			return "opened";
 		} catch (error) {
 			if (!/no mod/i.test(String((error as Error)?.message ?? error)) || Date.now() > until) throw error;

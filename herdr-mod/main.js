@@ -5,7 +5,7 @@
 // It also beats .alive/<id>.txt so Pi knows the pane is still open.
 // Installed by the pi-md-viewer extension; edits here are overwritten.
 
-import { View, div } from "gpui-kit";
+import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle, TextView } from "gpui-base";
 import { appHome, checking, exec, nextCommand, props, readTextFile, theme, writeTextFile } from "herdr";
 
@@ -60,6 +60,29 @@ function sections(text) {
 }
 
 /** Drop YAML front matter: show it as a small table-ish block instead of raw dashes. */
+/** A section's Markdown, with its mermaid blocks pulled out: [{ md } | { mermaid }]. */
+function parts(text) {
+  const out = [];
+  const re = /^(```|~~~)\s*mermaid\s*\n([\s\S]*?)\n\1\s*$/gm;
+  let at = 0;
+  for (const m of text.matchAll(re)) {
+    const before = text.slice(at, m.index).trim();
+    if (before) out.push({ md: before });
+    out.push({ mermaid: m[2] });
+    at = m.index + m[0].length;
+  }
+  const rest = text.slice(at).trim();
+  if (rest) out.push({ md: rest });
+  return out;
+}
+
+/** FNV-1a, for cache file names. */
+function hashOf(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
 function frontMatter(text) {
   const m = /^---\n([\s\S]*?)\n---\n?/.exec(text);
   if (!m) return { meta: [], body: text };
@@ -87,6 +110,8 @@ export default class MdViewer extends View {
     this.nonce = 0;
     this.doc = null;
     this.scroll = ScrollHandle.new();
+    this.mermaid = null; // { node, script }: how to render diagrams (sent by Pi)
+    this.diagrams = new Map(); // key -> { state: "busy" | "ready" | "error", width, height, error }
     if (checking()) return;
     this.tick(cx);
     this.beat();
@@ -103,6 +128,18 @@ export default class MdViewer extends View {
       }
     });
     cx.timer.every(READ_MS, (cx) => this.tick(cx));
+    // Diagrams wait for the real width (on_size_change); after a hot reload it may not
+    // report again, so go with what we have after a moment.
+    cx.timer.after(800, (cx) => {
+      if (this.sized) return;
+      this.sized = true;
+      cx.notify();
+    });
+    cx.timer.every(250, (cx) => {
+      const jobs = this.jobs ?? [];
+      this.jobs = [];
+      for (const job of jobs) cx.spawn(async (cx) => job(cx));
+    });
     cx.timer.every(BEAT_MS, (cx) => {
       this.beat();
       cx.notify(); // "updated … ago"
@@ -122,6 +159,7 @@ export default class MdViewer extends View {
             if (c.file && c.file !== this.file) this.switchTo(c.file);
             this.follow = !!c.follow;
             this.recent = Array.isArray(c.recent) ? c.recent : [];
+            this.mermaid = c.mermaid ?? null;
             changed = true;
           } catch (e) {
             this.problem = `Can't read what Pi sent: ${e?.message ?? e}`;
@@ -334,6 +372,7 @@ export default class MdViewer extends View {
     const { meta, body, secs } = this.doc;
     const pad = this.width < 640 ? 20 : 44;
     const column = () => v_flex().w_full().max_w(760).px(pad);
+    const colW = Math.min(760, this.width - (this.sideShown ? 210 : 0)) - 2 * pad;
     return v_flex()
       .id(`scroll-${this.nonce}`)
       .flex_1()
@@ -375,11 +414,88 @@ export default class MdViewer extends View {
                 .text_size(this.size)
                 .line_height(1.6)
                 .text_color(t.foreground)
-                .child(TextView.markdown(`md-${this.nonce}-${i}`, sec.text).selectable(true)),
+                .children(
+                  parts(sec.text).map((p, j) =>
+                    p.md !== undefined
+                      ? TextView.markdown(`md-${this.nonce}-${i}-${j}`, p.md).selectable(true)
+                      : this.diagram(t, p.mermaid, colW, `${i}-${j}`),
+                  ),
+                ),
             ),
         ),
       )
       .child(column().h(120));
+  }
+
+  /** A mermaid block: its picture once rendered (cached by code + colors), else a note. */
+  diagram(t, code, colW, id) {
+    const box = (child) => div().id(`dg-${this.nonce}-${id}`).w_full().my(10).p(14).rounded(8).bg(t.surface).border(1).border_color(t.border).flex().justify_center().child(child);
+    if (!this.mermaid) return box(div().text_size(12).text_color(t.dim).child("Mermaid diagram (open it with /md to render)"));
+    const bg = t.surface.slice(0, 7);
+    const avail = Math.max(120, colW - 30);
+    const bucket = Math.max(300, Math.round(avail / 100) * 100); // re-layout only when the width changes a lot
+    const key = hashOf(`${code}|${bg}|${t.foreground}|${t.accent}|${bucket}`);
+    const d = this.diagrams.get(key);
+    // A render that never came back (its task stopped, e.g. on a hot reload) is retried.
+    const stale = d?.state === "busy" && Date.now() - d.at > 40000;
+    if ((!d || stale) && this.sized) {
+      this.diagrams.set(key, { state: "busy", at: Date.now() });
+      this.renderDiagram(key, code, bg, t.foreground.slice(0, 7), t.accent.slice(0, 7), bucket);
+    }
+    if (!d || d.state === "busy") return box(div().text_size(12).text_color(t.dim).child("Rendering diagram…"));
+    if (d.state === "error")
+      return v_flex()
+        .w_full()
+        .child(div().text_size(11.5).text_color(t.blocked).child(`Mermaid: ${d.error}`))
+        .child(TextView.markdown(`dge-${this.nonce}-${id}`, "```mermaid\n" + code + "\n```"));
+    // Fit the column (never upscale past 110%); click opens the full-size picture.
+    const scale = Math.min(1.1, avail / d.width);
+    const w = d.width * scale;
+    const h = d.height * scale;
+    const png = `${appHome()}/mods/md-viewer/.cache/${key}.png`;
+    return v_flex()
+      .id(`dg-${this.nonce}-${id}`)
+      .w_full()
+      .my(10)
+      .p(14)
+      .gap(6)
+      .items_center()
+      .rounded(8)
+      .bg(t.surface)
+      .border(1)
+      .border_color(t.border)
+      .cursor_pointer()
+      .hover((x) => x.border_color(t.input ?? t.accent))
+      .on_click(() => exec("open", [png]).catch(() => {}))
+      .child(image(`mods/md-viewer/.cache/${key}.png`).flex_none().w(w).h(h))
+      .when(scale < 0.8, (x) => x.child(div().text_size(10.5).text_color(t.dim).child("Scaled to fit · click for full size")));
+  }
+
+  renderDiagram(key, code, bg, fg, accent, maxWidth) {
+    const dir = `${appHome()}/mods/md-viewer/.cache`;
+    const set = (v, cx) => {
+      this.diagrams.set(key, v);
+      cx.notify();
+    };
+    this.spawnLater((cx) =>
+      (async () => {
+        const cached = await readTextFile(`${dir}/${key}.json`).catch(() => null);
+        if (cached) return set({ state: "ready", ...JSON.parse(cached) }, cx);
+        const mmd = `${dir}/${key}.mmd`;
+        const prev = await readTextFile(mmd).catch(() => null);
+        if (prev !== code) await writeTextFile(mmd, code, prev);
+        const r = await exec(this.mermaid.node, [this.mermaid.script, mmd, `${dir}/${key}.png`, bg, fg, accent, String(maxWidth)], { timeout: 30000 });
+        const meta = await readTextFile(`${dir}/${key}.json`).catch(() => null);
+        if (r.code === 0 && meta) return set({ state: "ready", ...JSON.parse(meta) }, cx);
+        const err = await readTextFile(`${dir}/${key}.err`).catch(() => null);
+        set({ state: "error", error: (err || r.stderr || "render failed").trim().split("\n")[0] }, cx);
+      })().catch((e) => set({ state: "error", error: String(e?.message ?? e) }, cx)),
+    );
+  }
+
+  /** Start async work from render(), which has no cx of its own to spawn with. */
+  spawnLater(fn) {
+    (this.jobs ??= []).push(fn);
   }
 
   /** Scroll so section i starts at the top: jump past it to the end, then back up to it. */
@@ -398,14 +514,15 @@ export default class MdViewer extends View {
   render() {
     const t = theme();
     const heads = this.doc ? this.doc.secs.map((s, i) => (s.heading ? { ...s.heading, index: i } : null)).filter(Boolean) : [];
-    const side = this.showOutline && this.width >= 760 && (heads.length > 1 || this.recent.length > 1);
+    const side = (this.sideShown = this.showOutline && this.width >= 760 && (heads.length > 1 || this.recent.length > 1));
     return v_flex()
       .id("root")
       .size_full()
       .bg(t.background)
       .on_size_change((size, cx) => {
-        if (Math.abs(size.width - this.width) < 1) return;
+        if (this.sized && Math.abs(size.width - this.width) < 1) return;
         this.width = size.width;
+        this.sized = true;
         cx.notify();
       })
       .child(this.header(t))

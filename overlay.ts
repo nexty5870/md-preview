@@ -6,6 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
+import { asciiBlocks } from "./mermaid.ts";
 import { Markdown, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 
 const MAX_COLS = 100;
@@ -28,7 +29,7 @@ export class MarkdownReader implements Component {
 		private label: string,
 		private done: () => void,
 	) {
-		this.md = new Markdown("", 0, 0, getMarkdownTheme());
+		this.md = new Markdown("", 0, 0, getMarkdownTheme(), undefined, { transform: (md, width) => asciiBlocks(md, width) });
 		this.load();
 		this.timer = setInterval(() => {
 			if (this.load()) {
